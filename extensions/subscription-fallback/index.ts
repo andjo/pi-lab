@@ -12,13 +12,13 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { getModels } from "@mariozechner/pi-ai";
 import {
-  getModels,
   loginAnthropic,
   loginOpenAICodex,
   refreshAnthropicToken,
   refreshOpenAICodexToken,
-} from "@mariozechner/pi-ai";
+} from "@mariozechner/pi-ai/oauth";
 import { Type } from "@sinclair/typebox";
 
 type InputSource = "interactive" | "rpc" | "extension";
@@ -2883,17 +2883,36 @@ export default function (pi: ExtensionAPI): void {
   }
 
   async function isOauthProviderAuthenticated(ctx: any, providerId: string): Promise<boolean> {
-    if (!ctx?.modelRegistry?.getApiKey) return false;
+    const registry = ctx?.modelRegistry;
+    if (!registry) return false;
+
+    try {
+      if (typeof registry.getApiKeyForProvider === "function") {
+        const apiKey = await registry.getApiKeyForProvider(providerId);
+        if (apiKey && String(apiKey).trim()) return true;
+      }
+    } catch {
+      // Fall through to model-based lookups below for older pi versions.
+    }
 
     const model = findAnyModelForProvider(ctx, providerId);
     if (!model) return false;
 
     try {
-      const apiKey = await ctx.modelRegistry.getApiKey(model);
-      return Boolean(apiKey && String(apiKey).trim());
+      if (typeof registry.getApiKeyAndHeaders === "function") {
+        const auth = await registry.getApiKeyAndHeaders(model);
+        return Boolean(auth?.ok && auth?.apiKey && String(auth.apiKey).trim());
+      }
+
+      if (typeof registry.getApiKey === "function") {
+        const apiKey = await registry.getApiKey(model);
+        return Boolean(apiKey && String(apiKey).trim());
+      }
     } catch {
       return false;
     }
+
+    return false;
   }
 
   async function missingOauthProviders(

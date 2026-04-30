@@ -42,6 +42,10 @@ function patchedExtensionSource() {
       `from "${pathToFileURL(PI_AI_STUB).href}"`,
     )
     .replace(
+      'from "@mariozechner/pi-ai/oauth"',
+      `from "${pathToFileURL(PI_AI_STUB).href}"`,
+    )
+    .replace(
       'from "@sinclair/typebox"',
       `from "${pathToFileURL(TYPEBOX_STUB).href}"`,
     );
@@ -64,6 +68,8 @@ export async function createSubswitchRuntime(options) {
     hasUI = true,
     fetchImpl,
     startSession = true,
+    getApiKeyForProvider,
+    getApiKeyAndHeaders,
   } = options;
 
   if (!config) {
@@ -163,9 +169,27 @@ export async function createSubswitchRuntime(options) {
       find(provider, modelId) {
         return modelMap.get(`${provider}/${modelId}`);
       },
-      async getApiKey(model) {
-        return getApiKey(model);
-      },
+      ...(getApiKey !== undefined
+        ? {
+            async getApiKey(model) {
+              return getApiKey(model);
+            },
+          }
+        : {}),
+      ...(getApiKeyForProvider !== undefined
+        ? {
+            async getApiKeyForProvider(provider) {
+              return getApiKeyForProvider(provider);
+            },
+          }
+        : {}),
+      ...(getApiKeyAndHeaders !== undefined
+        ? {
+            async getApiKeyAndHeaders(model) {
+              return getApiKeyAndHeaders(model);
+            },
+          }
+        : {}),
       getAvailable() {
         return Array.from(modelMap.values());
       },

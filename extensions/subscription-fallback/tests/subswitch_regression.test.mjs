@@ -58,6 +58,36 @@ function openaiClaudeConfig() {
   };
 }
 
+function singleOauthConfig() {
+  return {
+    enabled: true,
+    default_vendor: 'openai',
+    rate_limit_patterns: [],
+    failover: {
+      scope: 'global',
+      return_to_preferred: { enabled: true, min_stable_minutes: 10 },
+      triggers: { rate_limit: true, quota_exhausted: true, auth_error: true },
+    },
+    preference_stack: [{ route_id: 'openai-oauth-work' }],
+    vendors: [
+      {
+        vendor: 'openai',
+        oauth_cooldown_minutes: 180,
+        api_key_cooldown_minutes: 15,
+        auto_retry: true,
+        routes: [
+          {
+            id: 'openai-oauth-work',
+            auth_type: 'oauth',
+            label: 'work',
+            provider_id: 'openai-codex-work',
+          },
+        ],
+      },
+    ],
+  };
+}
+
 function openaiPreferredRecoveryConfig() {
   return {
     enabled: true,
@@ -96,6 +126,25 @@ function openaiPreferredRecoveryConfig() {
     ],
   };
 }
+
+test('login-status recognizes OAuth with modern provider-level auth lookup', async () => {
+  const runtime = await createSubswitchRuntime({
+    config: singleOauthConfig(),
+    initialModel: { provider: 'openai-codex-work', id: 'gpt-5.5' },
+    models: [createModel('openai-codex-work', 'gpt-5.5', { contextWindow: 272_000 })],
+    getApiKey: undefined,
+    getApiKeyForProvider: async (provider) => (provider === 'openai-codex-work' ? 'oauth-token' : ''),
+  });
+
+  try {
+    await runtime.runCommand('login-status');
+
+    assert.ok(hasText(runtime, 'OAuth login checklist complete'));
+    assert.ok(!hasText(runtime, 'Missing OAuth login'));
+  } finally {
+    await runtime.shutdown();
+  }
+});
 
 test('manual switch compacts and then switches when context is too large', async () => {
   const runtime = await createSubswitchRuntime({
