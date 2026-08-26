@@ -46,6 +46,10 @@ function patchedExtensionSource() {
       `from "${pathToFileURL(PI_AI_STUB).href}"`,
     )
     .replace(
+      'from "@mariozechner/pi-ai/providers/all"',
+      `from "${pathToFileURL(PI_AI_STUB).href}"`,
+    )
+    .replace(
       'from "@sinclair/typebox"',
       `from "${pathToFileURL(TYPEBOX_STUB).href}"`,
     );

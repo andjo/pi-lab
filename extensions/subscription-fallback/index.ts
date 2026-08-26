@@ -12,13 +12,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { getModels } from "@mariozechner/pi-ai";
-import {
-  loginAnthropic,
-  loginOpenAICodex,
-  refreshAnthropicToken,
-  refreshOpenAICodexToken,
-} from "@mariozechner/pi-ai/oauth";
+import { builtinProviders, getBuiltinModels as getModels } from "@mariozechner/pi-ai/providers/all";
 import { Type } from "@sinclair/typebox";
 
 type InputSource = "interactive" | "rpc" | "extension";
@@ -1007,6 +1001,143 @@ function providerBaseUrl(sourceProvider: string): string | undefined {
   const models = getModels(sourceProvider);
   if (!models || models.length === 0) return undefined;
   return (models[0] as any).baseUrl;
+}
+
+// ---------------------------------------------------------------------------
+// Built-in OAuth delegation
+//
+// pi-ai (>= 0.8x) removed the standalone loginOpenAICodex/loginAnthropic/
+// refresh* helpers from the "oauth" subpath (it is now type-only). The flows
+// live on each built-in provider as a native OAuthAuth object with
+// login(interaction) / refresh(credential, signal). Alias providers delegate
+// to those objects instead of re-implementing the OAuth protocols.
+// ---------------------------------------------------------------------------
+
+interface NativeOAuthAuth {
+  name?: string;
+  isSubscription?: boolean;
+  login(interaction: any): Promise<any>;
+  refresh(credential: any, signal: AbortSignal): Promise<any>;
+  toAuth?(credential: any): Promise<any>;
+}
+
+function builtinOAuthAuth(sourceProvider: string): NativeOAuthAuth | undefined {
+  const providers = builtinProviders() ?? [];
+  const provider = providers.find((p: any) => p?.id === sourceProvider);
+  const oauth = provider?.auth?.oauth as NativeOAuthAuth | undefined;
+  return typeof oauth?.login === "function" ? oauth : undefined;
+}
+
+/**
+ * Bridge the legacy OAuthLoginCallbacks surface (what pi passes to a
+ * registered provider's oauth.login) to the native ProviderAuthInteraction
+ * consumed by pi-ai's built-in OAuth flows.
+ */
+function legacyCallbacksToInteraction(callbacks: any): any {
+  const signal: AbortSignal = callbacks?.signal ?? new AbortController().signal;
+
+  const notify = (event: any): void => {
+    if (!event) return;
+    switch (event.type) {
+      case "auth_url":
+        callbacks.onAuth?.({ url: event.url, instructions: event.instructions });
+        return;
+      case "device_code":
+        callbacks.onDeviceCode?.({
+          userCode: event.userCode,
+          verificationUri: event.verificationUri,
+          intervalSeconds: event.intervalSeconds,
+          expiresInSeconds: event.expiresInSeconds,
+        });
+        return;
+      case "info":
+        if (event.links?.length && typeof callbacks.onAuth === "function") {
+          callbacks.onAuth({ url: event.links[0].url, instructions: event.message });
+        } else {
+          callbacks.onProgress?.(event.message);
+        }
+        return;
+      default:
+        callbacks.onProgress?.(event.message);
+    }
+  };
+
+  const prompt = async (p: any): Promise<string> => {
+    if (!p) throw new Error("Login cancelled");
+    switch (p.type) {
+      case "select": {
+        if (typeof callbacks.onSelect === "function") {
+          return callbacks.onSelect({
+            message: p.message,
+            options: p.options,
+          });
+        }
+        // Fallback: plain text prompt listing the option ids.
+        const listing = (p.options ?? [])
+          .map((o: any) => `${o.id} - ${o.label}`)
+          .join("\n");
+        return callbacks.onPrompt({
+          message: `${p.message}\n${listing}\nEnter option id:`,
+          allowEmpty: false,
+        });
+      }
+      case "manual_code": {
+        if (typeof callbacks.onManualCodeInput === "function") {
+          return callbacks.onManualCodeInput();
+        }
+        return callbacks.onPrompt({
+          message: p.message,
+          placeholder: p.placeholder,
+          allowEmpty: true,
+        });
+      }
+      default:
+        return callbacks.onPrompt({
+          message: p.message,
+          placeholder: p.placeholder,
+          allowEmpty: p.allowEmpty,
+        });
+    }
+  };
+
+  return { signal, prompt, notify };
+}
+
+async function loginViaBuiltinOAuth(sourceProvider: string, callbacks: any): Promise<any> {
+  const oauth = builtinOAuthAuth(sourceProvider);
+  if (!oauth) {
+    throw new Error(
+      `Built-in OAuth flow for "${sourceProvider}" is not available in this pi version`,
+    );
+  }
+  const credential = await oauth.login(legacyCallbacksToInteraction(callbacks));
+  return {
+    refresh: String(credential?.refresh ?? ""),
+    access: String(credential?.access ?? ""),
+    expires: Number(credential?.expires ?? 0),
+  };
+}
+
+async function refreshViaBuiltinOAuth(
+  sourceProvider: string,
+  credentials: any,
+  signal?: AbortSignal,
+): Promise<any> {
+  const oauth = builtinOAuthAuth(sourceProvider);
+  if (!oauth) {
+    throw new Error(
+      `Built-in OAuth refresh for "${sourceProvider}" is not available in this pi version`,
+    );
+  }
+  const credential = await oauth.refresh(
+    { ...credentials, type: "oauth" },
+    signal ?? new AbortController().signal,
+  );
+  return {
+    refresh: String(credential?.refresh ?? ""),
+    access: String(credential?.access ?? ""),
+    expires: Number(credential?.expires ?? 0),
+  };
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -2477,16 +2608,10 @@ export default function (pi: ExtensionAPI): void {
       oauth: {
         name: `ChatGPT Plus/Pro (Codex Subscription) (${label})`,
         async login(callbacks: any) {
-          return loginOpenAICodex({
-            onAuth: callbacks.onAuth,
-            onPrompt: callbacks.onPrompt,
-            onProgress: callbacks.onProgress,
-            onManualCodeInput: callbacks.onManualCodeInput,
-            originator: providerId,
-          });
+          return loginViaBuiltinOAuth("openai-codex", callbacks);
         },
-        async refreshToken(credentials: any) {
-          return refreshOpenAICodexToken(String(credentials.refresh));
+        async refreshToken(credentials: any, signal?: AbortSignal) {
+          return refreshViaBuiltinOAuth("openai-codex", credentials, signal);
         },
         getApiKey(credentials: any) {
           return String(credentials.access);
@@ -2518,13 +2643,10 @@ export default function (pi: ExtensionAPI): void {
       oauth: {
         name: `Anthropic (Claude Pro/Max) (${label})`,
         async login(callbacks: any) {
-          return loginAnthropic(
-            (url) => callbacks.onAuth({ url }),
-            () => callbacks.onPrompt({ message: "Paste the authorization code:" }),
-          );
+          return loginViaBuiltinOAuth("anthropic", callbacks);
         },
-        async refreshToken(credentials: any) {
-          return refreshAnthropicToken(String(credentials.refresh));
+        async refreshToken(credentials: any, signal?: AbortSignal) {
+          return refreshViaBuiltinOAuth("anthropic", credentials, signal);
         },
         getApiKey(credentials: any) {
           return String(credentials.access);
