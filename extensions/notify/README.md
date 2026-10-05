@@ -18,7 +18,7 @@ It is loaded automatically with the other pi-lab extensions.
 
 This extension sends a notification for two events:
 
-- `agent_settled` — title `Pi`, message `Ready for input`. If `pi-subagents` has active background runs in this session, this notification waits until those runs complete.
+- `agent_settled` — title `Pi`, message `Ready for input`. If `pi-subagents` has active background runs in this session, the notification waits for those runs and any parent-agent turn that actually starts after completion. If no follow-up turn starts, it sends after a short grace period.
 - `permissions:ask` — title `Pi`, message `Permission required: <toolName>`
 
 The notification extension tracks `pi-subagents` lifecycle events and reconciles active runs from its status RPC when a session starts or reloads. Without `pi-subagents`, `agent_settled` notifications keep their normal behavior.

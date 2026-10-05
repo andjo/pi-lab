@@ -6,7 +6,7 @@ export const SUBAGENT_RPC_READY_EVENT = "subagents:rpc:v1:ready";
 export const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
 export const SUBAGENT_RPC_REPLY_EVENT_PREFIX = "subagents:rpc:v1:reply:";
 
-type RunChange = { id: string; active: boolean };
+type RunChange = { id: string; active: boolean; triggerParentRun?: boolean };
 
 export class SubagentNotificationGate {
   private sessionId: string | undefined;
@@ -14,15 +14,30 @@ export class SubagentNotificationGate {
   private pendingNotification: NotifyPayload | undefined;
   private statusSyncPending = false;
   private statusSyncChanges: RunChange[] | undefined;
+  private awaitingTriggeredParentRun = false;
+  private triggeredParentRunStarted = false;
+  private triggerAfterGeneration = 0;
+  private parentRunGeneration = 0;
+  private parentAgentBusy = false;
+  private noFollowupTimer: NodeJS.Timeout | undefined;
 
-  constructor(private readonly notify: (payload: NotifyPayload) => void) {}
+  constructor(
+    private readonly notify: (payload: NotifyPayload) => void,
+    private readonly noFollowupGraceMs = 1000,
+  ) {}
 
   reset(sessionId: string | undefined): void {
+    this.clearNoFollowupTimer();
     this.sessionId = sessionId;
     this.activeRuns.clear();
     this.pendingNotification = undefined;
     this.statusSyncPending = false;
     this.statusSyncChanges = undefined;
+    this.awaitingTriggeredParentRun = false;
+    this.triggeredParentRunStarted = false;
+    this.triggerAfterGeneration = 0;
+    this.parentRunGeneration = 0;
+    this.parentAgentBusy = false;
   }
 
   beginStatusSync(): void {
@@ -39,12 +54,27 @@ export class SubagentNotificationGate {
     this.track(value, false);
   }
 
-  settle(payload: NotifyPayload): void {
-    if (this.activeRuns.size > 0 || this.statusSyncPending) {
-      this.pendingNotification = payload;
-      return;
+  parentAgentStarted(): void {
+    this.parentRunGeneration += 1;
+    this.parentAgentBusy = true;
+    if (this.awaitingTriggeredParentRun && this.parentRunGeneration > this.triggerAfterGeneration) {
+      this.triggeredParentRunStarted = true;
+      this.clearNoFollowupTimer();
     }
-    this.notify(payload);
+  }
+
+  settle(payload: NotifyPayload): void {
+    this.parentAgentBusy = false;
+    this.pendingNotification = payload;
+    if (this.awaitingTriggeredParentRun) {
+      if (!this.triggeredParentRunStarted) {
+        this.scheduleNoFollowupCheck();
+        return;
+      }
+      this.awaitingTriggeredParentRun = false;
+      this.triggeredParentRunStarted = false;
+    }
+    this.flush();
   }
 
   /** Reconcile against pi-subagents' current-session RPC status snapshot. */
@@ -53,8 +83,12 @@ export class SubagentNotificationGate {
       this.activeRuns = new Set(activeRunIds);
     }
     for (const change of this.statusSyncChanges ?? []) {
-      if (change.active) this.activeRuns.add(change.id);
-      else this.activeRuns.delete(change.id);
+      if (change.active) {
+        this.activeRuns.add(change.id);
+      } else {
+        this.activeRuns.delete(change.id);
+        if (change.triggerParentRun) this.markParentRunExpected();
+      }
     }
     this.finishStatusSync();
   }
@@ -64,20 +98,85 @@ export class SubagentNotificationGate {
     const id = typeof value.id === "string" ? value.id : value.runId;
     if (typeof id !== "string" || id.length === 0) return;
 
-    if (active) this.activeRuns.add(id);
-    else this.activeRuns.delete(id);
-    this.statusSyncChanges?.push({ id, active });
+    const triggerParentRun = !active && value.triggerTurn !== false;
+    if (active) {
+      this.activeRuns.add(id);
+    } else {
+      this.activeRuns.delete(id);
+      if (triggerParentRun) this.markParentRunExpected();
+    }
+    this.statusSyncChanges?.push({ id, active, triggerParentRun });
     this.flush();
+    this.scheduleNoFollowupCheck();
+  }
+
+  parentAgentStopped(): void {
+    this.parentAgentBusy = false;
+    this.flush();
+    this.scheduleNoFollowupCheck();
+  }
+
+  private markParentRunExpected(): void {
+    this.awaitingTriggeredParentRun = true;
+    this.triggeredParentRunStarted = false;
+    this.triggerAfterGeneration = this.parentRunGeneration;
+    this.clearNoFollowupTimer();
   }
 
   private finishStatusSync(): void {
     this.statusSyncPending = false;
     this.statusSyncChanges = undefined;
     this.flush();
+    this.scheduleNoFollowupCheck();
+  }
+
+  private scheduleNoFollowupCheck(): void {
+    if (
+      !this.awaitingTriggeredParentRun ||
+      this.triggeredParentRunStarted ||
+      this.parentAgentBusy ||
+      this.activeRuns.size > 0 ||
+      this.statusSyncPending ||
+      !this.pendingNotification ||
+      this.noFollowupTimer
+    ) {
+      return;
+    }
+
+    this.noFollowupTimer = setTimeout(() => {
+      this.noFollowupTimer = undefined;
+      if (
+        !this.awaitingTriggeredParentRun ||
+        this.triggeredParentRunStarted ||
+        this.parentAgentBusy ||
+        this.activeRuns.size > 0 ||
+        this.statusSyncPending
+      ) {
+        this.scheduleNoFollowupCheck();
+        return;
+      }
+      this.awaitingTriggeredParentRun = false;
+      this.triggeredParentRunStarted = false;
+      this.flush();
+    }, this.noFollowupGraceMs);
+  }
+
+  private clearNoFollowupTimer(): void {
+    if (!this.noFollowupTimer) return;
+    clearTimeout(this.noFollowupTimer);
+    this.noFollowupTimer = undefined;
   }
 
   private flush(): void {
-    if (this.activeRuns.size > 0 || this.statusSyncPending || !this.pendingNotification) return;
+    if (
+      this.activeRuns.size > 0 ||
+      this.statusSyncPending ||
+      this.awaitingTriggeredParentRun ||
+      this.parentAgentBusy ||
+      !this.pendingNotification
+    ) {
+      return;
+    }
     const payload = this.pendingNotification;
     this.pendingNotification = undefined;
     this.notify(payload);

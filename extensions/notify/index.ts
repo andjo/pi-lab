@@ -70,12 +70,21 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
     if (subagentRpcReady) syncActiveSubagents();
   });
 
+  pi.on("agent_start", () => {
+    notificationGate.parentAgentStarted();
+  });
+
+  pi.on("agent_end", () => {
+    notificationGate.parentAgentStopped();
+  });
+
   pi.on("agent_settled", async () => {
     notificationGate.settle(createPayload("agent_settled", AGENT_SETTLED_MESSAGE));
   });
 
   pi.on("session_shutdown", () => {
     cancelStatusSync();
+    notificationGate.reset(undefined);
   });
 
   pi.events.on("permissions:ask", (data: unknown) => {

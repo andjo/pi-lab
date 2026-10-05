@@ -78,14 +78,20 @@ function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
     async agentSettled() {
       await eventHandlers.agent_settled({ type: "agent_settled", messages: [] }, { cwd });
     },
+    agentStarted() {
+      eventHandlers.agent_start({ type: "agent_start" }, { cwd });
+    },
+    agentStopped() {
+      eventHandlers.agent_end({ type: "agent_end" }, { cwd });
+    },
     permissionAsk(toolName = "bash", toolCallId = "call-1") {
       for (const handler of busHandlers["permissions:ask"] ?? []) handler({ toolName, toolCallId, rule: {}, options: [] });
     },
     subagentStarted(id: string, sessionId = "/tmp/pi-notify-session.json") {
       for (const handler of busHandlers["subagent:async-started"] ?? []) handler({ id, sessionId });
     },
-    subagentCompleted(id: string, sessionId = "/tmp/pi-notify-session.json") {
-      for (const handler of busHandlers["subagent:async-complete"] ?? []) handler({ id, sessionId });
+    subagentCompleted(id: string, sessionId = "/tmp/pi-notify-session.json", triggerTurn = false) {
+      for (const handler of busHandlers["subagent:async-complete"] ?? []) handler({ id, sessionId, triggerTurn });
     },
     subagentRpcReady() {
       pi.events.emit("subagents:rpc:v1:ready", {});
@@ -146,6 +152,22 @@ test("restores active subagents from pi-subagents status after session start", a
   assert.deepEqual(app.sent, []);
 
   app.subagentCompleted("restored-run");
+  assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
+});
+
+test("waits for the parent's completion turn after a subagent completion wake", async () => {
+  const app = setup();
+  await app.start();
+
+  app.subagentStarted("run-1");
+  await app.agentSettled();
+  app.subagentCompleted("run-1", "/tmp/pi-notify-session.json", true);
+  assert.deepEqual(app.sent, []);
+
+  app.agentStarted();
+  assert.deepEqual(app.sent, []);
+  await app.agentSettled();
+
   assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
 });
 
