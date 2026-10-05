@@ -16,4 +16,4 @@ After install, restart `pi` (or run `/reload`) and the extensions in this repo w
 - `title-status`: shows a small status icon (busy/ready/pending) in the terminal title.
 - `live-commentary`: summarizes long-running bash tool output with a small widget (auto-starts after ~10s).
 - `session-context` (`/session-context`): generates a dedicated session summary line below the editor and a detailed modal on demand.
-- `notify`: sends desktop notifications when the agent is ready for input or a permission prompt is required, with tmux window alerts and an optional script hook.
+- `notify`: sends desktop notifications when the agent is ready for input (after active pi-subagents background runs finish) or a permission prompt is required, with tmux window alerts and an optional script hook.

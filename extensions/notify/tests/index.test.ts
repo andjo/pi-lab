@@ -12,13 +12,14 @@ type BusHandler = (payload: any) => void;
 function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
   const home = mkdtempSync(join(tmpdir(), "pi-notify-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-notify-cwd-"));
+  const sessionId = "/tmp/pi-notify-session.json";
   if (config) {
     mkdirSync(join(cwd, ".pi", "pi-lab"), { recursive: true });
     writeFileSync(join(cwd, ".pi", "pi-lab", "notify.json"), JSON.stringify(config), "utf8");
   }
 
   const eventHandlers: Record<string, EventHandler> = {};
-  const busHandlers: Record<string, BusHandler> = {};
+  const busHandlers: Record<string, BusHandler[]> = {};
   const sent: Array<{ title: string; message: string }> = [];
   const tmuxAlerts: string[] = [];
   const scripts: unknown[] = [];
@@ -30,7 +31,14 @@ function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
     },
     events: {
       on(name: string, handler: BusHandler) {
-        busHandlers[name] = handler;
+        busHandlers[name] ??= [];
+        busHandlers[name].push(handler);
+        return () => {
+          busHandlers[name] = busHandlers[name].filter((registered) => registered !== handler);
+        };
+      },
+      emit(name: string, payload: any) {
+        for (const handler of [...(busHandlers[name] ?? [])]) handler(payload);
       },
     },
   };
@@ -59,13 +67,37 @@ function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
     scripts,
     warnings,
     async start() {
-      await eventHandlers.session_start({ type: "session_start" }, { cwd });
+      await eventHandlers.session_start({ type: "session_start" }, {
+        cwd,
+        sessionManager: {
+          getSessionFile: () => sessionId,
+          getSessionId: () => "session-1",
+        },
+      });
     },
     async agentSettled() {
       await eventHandlers.agent_settled({ type: "agent_settled", messages: [] }, { cwd });
     },
     permissionAsk(toolName = "bash", toolCallId = "call-1") {
-      busHandlers["permissions:ask"]({ toolName, toolCallId, rule: {}, options: [] });
+      for (const handler of busHandlers["permissions:ask"] ?? []) handler({ toolName, toolCallId, rule: {}, options: [] });
+    },
+    subagentStarted(id: string, sessionId = "/tmp/pi-notify-session.json") {
+      for (const handler of busHandlers["subagent:async-started"] ?? []) handler({ id, sessionId });
+    },
+    subagentCompleted(id: string, sessionId = "/tmp/pi-notify-session.json") {
+      for (const handler of busHandlers["subagent:async-complete"] ?? []) handler({ id, sessionId });
+    },
+    subagentRpcReady() {
+      pi.events.emit("subagents:rpc:v1:ready", {});
+    },
+    respondWithActiveRuns(ids: string[]) {
+      pi.events.on("subagents:rpc:v1:request", (request) => {
+        pi.events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+          requestId: request.requestId,
+          success: true,
+          data: { asyncSnapshot: { runs: ids.map((id) => ({ id, state: "running" })) } },
+        });
+      });
     },
   };
 }
@@ -84,6 +116,55 @@ test("permissions:ask sends fixed default notification with tool name", async ()
   await app.start();
 
   app.permissionAsk("edit", "edit-call");
+
+  assert.deepEqual(app.sent, [{ title: "Pi", message: "Permission required: edit" }]);
+});
+
+test("agent_settled waits until all active async subagents have completed", async () => {
+  const app = setup();
+  await app.start();
+
+  app.subagentStarted("run-1");
+  app.subagentStarted("run-2");
+  await app.agentSettled();
+  assert.deepEqual(app.sent, []);
+
+  app.subagentCompleted("run-1");
+  assert.deepEqual(app.sent, []);
+
+  app.subagentCompleted("run-2");
+  assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
+});
+
+test("restores active subagents from pi-subagents status after session start", async () => {
+  const app = setup();
+  app.respondWithActiveRuns(["restored-run"]);
+  await app.start();
+  app.subagentRpcReady();
+
+  await app.agentSettled();
+  assert.deepEqual(app.sent, []);
+
+  app.subagentCompleted("restored-run");
+  assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
+});
+
+test("subagents from another session do not delay settled notifications", async () => {
+  const app = setup();
+  await app.start();
+
+  app.subagentStarted("other-run", "different-session");
+  await app.agentSettled();
+
+  assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
+});
+
+test("permission notifications are not delayed by running subagents", async () => {
+  const app = setup();
+  await app.start();
+
+  app.subagentStarted("run-1");
+  app.permissionAsk("edit");
 
   assert.deepEqual(app.sent, [{ title: "Pi", message: "Permission required: edit" }]);
 });
@@ -198,7 +279,13 @@ test("script hook errors are warned and do not stop notifications", async () => 
       warnings.push(message);
     },
   });
-  await eventHandlers.session_start({ type: "session_start" }, { cwd });
+  await eventHandlers.session_start({ type: "session_start" }, {
+    cwd,
+    sessionManager: {
+      getSessionFile: () => "/tmp/pi-notify-session.json",
+      getSessionId: () => "session-1",
+    },
+  });
 
   await eventHandlers.agent_settled({ type: "agent_settled", messages: [] }, { cwd });
 

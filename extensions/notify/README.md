@@ -18,10 +18,12 @@ It is loaded automatically with the other pi-lab extensions.
 
 This extension sends a notification for two events:
 
-- `agent_settled` — title `Pi`, message `Ready for input`
+- `agent_settled` — title `Pi`, message `Ready for input`. If `pi-subagents` has active background runs in this session, this notification waits until those runs complete.
 - `permissions:ask` — title `Pi`, message `Permission required: <toolName>`
 
-`permissions:ask` is emitted by [`@pi-lab/permissions`](https://www.npmjs.com/package/@pi-lab/permissions) immediately before a permission prompt is shown.
+The notification extension tracks `pi-subagents` lifecycle events and reconciles active runs from its status RPC when a session starts or reloads. Without `pi-subagents`, `agent_settled` notifications keep their normal behavior.
+
+`permissions:ask` is emitted by [`@pi-lab/permissions`](https://www.npmjs.com/package/@pi-lab/permissions) immediately before a permission prompt is shown. Permission notifications are sent immediately and are not held for background runs.
 
 When Pi runs inside tmux, each notification also emits a terminal bell. For a background window, tmux marks and highlights its window label until the window is selected. This requires tmux's `monitor-bell` window option, which is enabled by default. The highlight uses `window-status-bell-style` and can be customized in `~/.tmux.conf`:
 
