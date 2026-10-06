@@ -25,6 +25,8 @@ The notification extension tracks `pi-subagents` lifecycle events and reconciles
 
 `permissions:ask` is emitted by [`@pi-lab/permissions`](https://www.npmjs.com/package/@pi-lab/permissions) immediately before a permission prompt is shown. Permission notifications are sent immediately and are not held for background runs.
 
+When `PI_INSIDE_FROSTPI=1`, this extension suppresses all notifications, including built-in desktop notifications, tmux alerts, and configured script hooks.
+
 When Pi runs inside tmux, each notification also emits a terminal bell. For a background window, tmux marks and highlights its window label until the window is selected. This requires tmux's `monitor-bell` window option, which is enabled by default. The highlight uses `window-status-bell-style` and can be customized in `~/.tmux.conf`:
 
 ```tmux

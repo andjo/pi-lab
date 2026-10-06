@@ -256,6 +256,21 @@ test("enable false disables default notifications but keeps script hook", async 
   }
 });
 
+test("PI_INSIDE_FROSTPI=1 suppresses built-in, tmux, and script notifications", async () => {
+  const app = setup(
+    { notify: { script: "./notify.sh" } },
+    { PI_INSIDE_FROSTPI: "1", TMUX: "/tmp/tmux-1000/default,1,0" },
+  );
+  await app.start();
+
+  await app.agentSettled();
+  app.permissionAsk();
+
+  assert.deepEqual(app.sent, []);
+  assert.deepEqual(app.tmuxAlerts, []);
+  assert.deepEqual(app.scripts, []);
+});
+
 test("script payload includes terminal context", async () => {
   const app = setup({ notify: { script: "./notify.sh" } }, process.env);
   await app.start();

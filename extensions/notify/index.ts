@@ -172,6 +172,8 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   }
 
   async function handleNotify(payload: NotifyPayload): Promise<void> {
+    if (env.PI_INSIDE_FROSTPI === "1") return;
+
     if (config.enable) {
       sendNotification(payload.title, payload.message);
       if (payload.terminal.tmux) {
