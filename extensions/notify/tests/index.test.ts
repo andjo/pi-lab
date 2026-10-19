@@ -24,8 +24,12 @@ function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
   const tmuxAlerts: string[] = [];
   const scripts: unknown[] = [];
   const warnings: string[] = [];
+  let subagentToolAvailable = false;
 
   const pi = {
+    getAllTools() {
+      return subagentToolAvailable ? [{ name: "subagent" }] : [];
+    },
     on(name: string, handler: EventHandler) {
       eventHandlers[name] = handler;
     },
@@ -96,6 +100,12 @@ function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
     subagentRpcReady() {
       pi.events.emit("subagents:rpc:v1:ready", {});
     },
+    enableSubagentTool() {
+      subagentToolAvailable = true;
+    },
+    async shutdown() {
+      await eventHandlers.session_shutdown({ type: "session_shutdown" }, { cwd });
+    },
     respondWithActiveRuns(ids: string[]) {
       pi.events.on("subagents:rpc:v1:request", (request) => {
         pi.events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
@@ -103,6 +113,15 @@ function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
           success: true,
           data: { asyncSnapshot: { runs: ids.map((id) => ({ id, state: "running" })) } },
         });
+      });
+    },
+    onStatusRequest(handler: (reply: (ids: string[]) => void) => void) {
+      pi.events.on("subagents:rpc:v1:request", (request) => {
+        handler((ids) => pi.events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+          requestId: request.requestId,
+          success: true,
+          data: { asyncSnapshot: { runs: ids.map((id) => ({ id, state: "running" })) } },
+        }));
       });
     },
   };
@@ -153,6 +172,137 @@ test("restores active subagents from pi-subagents status after session start", a
 
   app.subagentCompleted("restored-run");
   assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
+});
+
+test("rechecks status at settle for runs whose start event was missed", async () => {
+  const app = setup();
+  const activeRuns: string[] = [];
+  app.respondWithActiveRuns(activeRuns);
+  await app.start();
+  app.subagentRpcReady();
+
+  activeRuns.push("missed-run");
+  await app.agentSettled();
+  assert.deepEqual(app.sent, []);
+
+  activeRuns.length = 0;
+  app.subagentCompleted("missed-run");
+  assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
+  await app.shutdown();
+});
+
+test("detects pi-subagents even when its RPC ready event was missed", async () => {
+  const app = setup();
+  app.enableSubagentTool();
+  app.respondWithActiveRuns(["already-running"]);
+  await app.start();
+
+  await app.agentSettled();
+  assert.deepEqual(app.sent, []);
+
+  app.subagentCompleted("already-running");
+  assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
+  await app.shutdown();
+});
+
+test("reconciles missed completion events while a notification is held", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const app = setup();
+  const activeRuns = ["run-1", "run-2"];
+  app.respondWithActiveRuns(activeRuns);
+  await app.start();
+  app.subagentRpcReady();
+  await app.agentSettled();
+  assert.deepEqual(app.sent, []);
+
+  activeRuns.splice(0, 1);
+  t.mock.timers.tick(5000);
+  assert.deepEqual(app.sent, []);
+
+  activeRuns.length = 0;
+  t.mock.timers.tick(5000);
+  assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
+  t.mock.timers.tick(10000);
+  assert.equal(app.sent.length, 1);
+  await app.shutdown();
+});
+
+test("holds notifications during an asynchronous status check and replays new starts", async () => {
+  const app = setup();
+  let reply: ((ids: string[]) => void) | undefined;
+  app.enableSubagentTool();
+  app.onStatusRequest((respond) => { reply = respond; });
+  await app.start();
+
+  await app.agentSettled();
+  assert.deepEqual(app.sent, []);
+  app.subagentStarted("started-during-check");
+  reply!([]);
+  assert.deepEqual(app.sent, []);
+
+  app.subagentCompleted("started-during-check");
+  assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
+  await app.shutdown();
+});
+
+test("settling replaces an older in-flight status query rather than trusting its snapshot", async () => {
+  const app = setup();
+  const replies: Array<(ids: string[]) => void> = [];
+  app.onStatusRequest((reply) => { replies.push(reply); });
+  await app.start();
+  app.subagentRpcReady();
+  assert.equal(replies.length, 1);
+
+  await app.agentSettled();
+  assert.equal(replies.length, 2);
+  replies[0]([]);
+  assert.deepEqual(app.sent, []);
+  replies[1](["launched-after-startup-query"]);
+  assert.deepEqual(app.sent, []);
+
+  app.subagentCompleted("launched-after-startup-query");
+  assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
+  await app.shutdown();
+});
+
+test("does not notify on a status timeout and retries until all runs finish", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const app = setup();
+  app.enableSubagentTool();
+  await app.start();
+  await app.agentSettled();
+
+  t.mock.timers.tick(5000);
+  assert.deepEqual(app.sent, []);
+  assert.equal(app.warnings.length, 1);
+
+  const activeRuns = ["still-running"];
+  app.respondWithActiveRuns(activeRuns);
+  t.mock.timers.tick(5000);
+  assert.deepEqual(app.sent, []);
+
+  activeRuns.length = 0;
+  t.mock.timers.tick(5000);
+  assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
+  await app.shutdown();
+});
+
+test("shutdown cancels polling and ignores late status replies", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const app = setup();
+  let reply: ((ids: string[]) => void) | undefined;
+  let requests = 0;
+  app.enableSubagentTool();
+  app.onStatusRequest((respond) => { requests += 1; reply = respond; });
+  await app.start();
+  await app.agentSettled();
+  await app.shutdown();
+
+  reply!([]);
+  app.subagentRpcReady();
+  t.mock.timers.tick(20000);
+  assert.deepEqual(app.sent, []);
+  assert.equal(requests, 1);
 });
 
 test("waits for the parent's completion turn after a subagent completion wake", async () => {

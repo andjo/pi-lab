@@ -40,6 +40,10 @@ export class SubagentNotificationGate {
     this.parentAgentBusy = false;
   }
 
+  get hasPendingNotification(): boolean {
+    return this.pendingNotification !== undefined;
+  }
+
   beginStatusSync(): void {
     if (this.statusSyncPending) return;
     this.statusSyncPending = true;
@@ -55,6 +59,10 @@ export class SubagentNotificationGate {
   }
 
   parentAgentStarted(): void {
+    // Readiness from an earlier turn is stale once the parent resumes. Only
+    // the new turn's agent_settled event may queue another notification.
+    this.pendingNotification = undefined;
+    this.clearNoFollowupTimer();
     this.parentRunGeneration += 1;
     this.parentAgentBusy = true;
     if (this.awaitingTriggeredParentRun && this.parentRunGeneration > this.triggerAfterGeneration) {

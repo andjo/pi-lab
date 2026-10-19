@@ -21,7 +21,7 @@ This extension sends a notification for two events:
 - `agent_settled` — title `Pi`, message `Ready for input`. If `pi-subagents` has active background runs in this session, the notification waits for those runs and any parent-agent turn that actually starts after completion. If no follow-up turn starts, it sends after a short grace period.
 - `permissions:ask` — title `Pi`, message `Permission required: <toolName>`
 
-The notification extension tracks `pi-subagents` lifecycle events and reconciles active runs from its status RPC when a session starts or reloads. Without `pi-subagents`, `agent_settled` notifications keep their normal behavior.
+The notification extension tracks `pi-subagents` lifecycle events and reconciles active runs from its status RPC when a session starts or reloads and whenever the parent settles. While a notification is held, status is checked every five seconds to recover from missed lifecycle events. A failed status check keeps the notification held until a successful retry. Resuming the parent discards any notification queued by its previous turn. Without `pi-subagents`, `agent_settled` notifications keep their normal behavior.
 
 `permissions:ask` is emitted by [`@pi-lab/permissions`](https://www.npmjs.com/package/@pi-lab/permissions) immediately before a permission prompt is shown. Permission notifications are sent immediately and are not held for background runs.
 

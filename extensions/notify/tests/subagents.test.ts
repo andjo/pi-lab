@@ -80,6 +80,27 @@ test("waits for the agent run triggered by a completion before flushing", () => 
   assert.equal(sent[0].notificationId, "pi-agent-settled-2");
 });
 
+test("a resumed parent discards readiness from its previous settled turn", () => {
+  const sent: NotifyPayload[] = [];
+  const gate = new SubagentNotificationGate((notification) => sent.push(notification));
+  gate.reset("session-1");
+  gate.trackStarted({ id: "run-1", sessionId: "session-1" });
+  gate.settle(payload());
+
+  gate.parentAgentStarted();
+  gate.trackCompleted({ id: "run-1", sessionId: "session-1", triggerTurn: false });
+  gate.parentAgentStopped();
+  assert.deepEqual(sent, []);
+
+  // The new turn can launch more work before it settles.
+  gate.trackStarted({ id: "run-2", sessionId: "session-1" });
+  const latest = { ...payload(), notificationId: "pi-agent-settled-2", timestamp: 2 };
+  gate.settle(latest);
+  assert.deepEqual(sent, []);
+  gate.trackCompleted({ id: "run-2", sessionId: "session-1", triggerTurn: false });
+  assert.deepEqual(sent, [latest]);
+});
+
 test("extracts only active top-level runs from the subagent status RPC reply", () => {
   assert.deepEqual(activeSubagentIdsFromRpcReply({
     success: true,

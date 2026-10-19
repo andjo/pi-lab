@@ -46,6 +46,7 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   const runScript = deps.runScript ?? runNotifyScript;
   const warn = deps.warn ?? ((message: string) => console.warn(message));
   const notificationGate = new SubagentNotificationGate((payload) => {
+    cancelStatusSync();
     void handleNotify(payload);
   });
 
@@ -79,11 +80,16 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   });
 
   pi.on("agent_settled", async () => {
+    // Lifecycle events can be missed (for example across reloads). Check the
+    // current fleet before allowing an idle parent to announce readiness.
+    syncActiveSubagents();
     notificationGate.settle(createPayload("agent_settled", AGENT_SETTLED_MESSAGE));
+    if (notificationGate.hasPendingNotification && subagentRpcReady && !statusSync) scheduleStatusSyncRetry();
   });
 
   pi.on("session_shutdown", () => {
     cancelStatusSync();
+    currentSessionId = undefined;
     notificationGate.reset(undefined);
   });
 
@@ -93,13 +99,13 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
     void handleNotify(createPayload("permission_ask", `Permission required: ${toolName}`));
   });
 
-  function cancelStatusSync(clearRetry = true): void {
+  function cancelStatusSync(): void {
     if (statusSync) {
       clearTimeout(statusSync.timeout);
       statusSync.unsubscribe();
       statusSync = undefined;
     }
-    if (clearRetry && statusRetry) {
+    if (statusRetry) {
       clearTimeout(statusRetry);
       statusRetry = undefined;
     }
@@ -114,12 +120,11 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   }
 
   function syncActiveSubagents(): void {
+    // The ready event is not replayed if this extension subscribes after it.
+    subagentRpcReady ||= pi.getAllTools?.().some((tool) => tool.name === "subagent") ?? false;
     if (!currentSessionId || !subagentRpcReady) return;
-    if (statusRetry) {
-      clearTimeout(statusRetry);
-      statusRetry = undefined;
-    }
-    cancelStatusSync(false);
+    // A lookup started earlier in the turn may predate its background launches.
+    cancelStatusSync();
 
     const requestId = randomUUID();
     const replyEvent = `${SUBAGENT_RPC_REPLY_EVENT_PREFIX}${requestId}`;
@@ -141,6 +146,8 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
       }
       statusSyncWarningLogged = false;
       notificationGate.reconcileStatus(activeRunIds);
+      // Keep held notifications live even if a completion event is also lost.
+      if (notificationGate.hasPendingNotification) scheduleStatusSyncRetry();
     };
 
     const unsubscribe = pi.events.on(replyEvent, (reply: unknown) => {
