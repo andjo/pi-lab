@@ -75,7 +75,7 @@ Local config overrides global config.
 }
 ```
 
-When configured, the script is executed for every notify event in addition to the built-in notification. The script receives a JSON payload on stdin and has a fixed 5 second timeout. Failures are warned in Pi and do not affect agent execution or permission prompts.
+When configured, the script is executed for every notify event in addition to the built-in notification. The script receives a JSON payload on stdin and has a fixed 5 second timeout. Failures appear as Pi UI warnings (or console warnings in non-interactive sessions) and do not affect agent execution or permission prompts.
 
 Example payload for `agent_settled`:
 

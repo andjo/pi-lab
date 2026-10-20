@@ -438,45 +438,54 @@ test("script payload includes terminal context", async () => {
   });
 });
 
-test("script hook errors are warned and do not stop notifications", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-notify-home-"));
-  const cwd = mkdtempSync(join(tmpdir(), "pi-notify-cwd-"));
-  mkdirSync(join(cwd, ".pi", "pi-lab"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "pi-lab", "notify.json"), JSON.stringify({ notify: { script: "./notify.sh" } }), "utf8");
+for (const hasUI of [false, true]) {
+  test(`script hook errors use ${hasUI ? "UI warnings" : "console fallback"} and do not stop notifications`, async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-notify-home-"));
+    const cwd = mkdtempSync(join(tmpdir(), "pi-notify-cwd-"));
+    mkdirSync(join(cwd, ".pi", "pi-lab"), { recursive: true });
+    writeFileSync(join(cwd, ".pi", "pi-lab", "notify.json"), JSON.stringify({ notify: { script: "./notify.sh" } }), "utf8");
 
-  const eventHandlers: Record<string, EventHandler> = {};
-  const sent: Array<{ title: string; message: string }> = [];
-  const warnings: string[] = [];
-  const pi = {
-    on(name: string, handler: EventHandler) {
-      eventHandlers[name] = handler;
-    },
-    events: { on() {} },
-  };
-  notify(pi as any, {
-    home,
-    env: {},
-    sendNotification(title, message) {
-      sent.push({ title, message });
-    },
-    runScript() {
-      throw new Error("boom");
-    },
-    warn(message) {
-      warnings.push(message);
-    },
+    const eventHandlers: Record<string, EventHandler> = {};
+    const sent: Array<{ title: string; message: string }> = [];
+    const warnings: string[] = [];
+    const uiWarnings: Array<{ message: string; type: string }> = [];
+    const pi = {
+      on(name: string, handler: EventHandler) {
+        eventHandlers[name] = handler;
+      },
+      events: { on() {} },
+    };
+    notify(pi as any, {
+      home,
+      env: {},
+      sendNotification(title, message) {
+        sent.push({ title, message });
+      },
+      runScript() {
+        throw new Error("boom");
+      },
+      warn(message) {
+        warnings.push(message);
+      },
+    });
+    await eventHandlers.session_start({ type: "session_start" }, {
+      cwd,
+      hasUI,
+      ui: {
+        notify(message: string, type: string) {
+          uiWarnings.push({ message, type });
+        },
+      },
+      sessionManager: {
+        getSessionFile: () => "/tmp/pi-notify-session.json",
+        getSessionId: () => "session-1",
+      },
+    });
+
+    await eventHandlers.agent_settled({ type: "agent_settled", messages: [] }, { cwd });
+
+    assert.deepEqual(sent, [{ title: "Pi", message: "Ready for input" }]);
+    assert.deepEqual(warnings, hasUI ? [] : ["notify script failed: boom"]);
+    assert.deepEqual(uiWarnings, hasUI ? [{ message: "notify script failed: boom", type: "warning" }] : []);
   });
-  await eventHandlers.session_start({ type: "session_start" }, {
-    cwd,
-    sessionManager: {
-      getSessionFile: () => "/tmp/pi-notify-session.json",
-      getSessionId: () => "session-1",
-    },
-  });
-
-  await eventHandlers.agent_settled({ type: "agent_settled", messages: [] }, { cwd });
-
-  assert.deepEqual(sent, [{ title: "Pi", message: "Ready for input" }]);
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /notify script failed: boom/);
-});
+}

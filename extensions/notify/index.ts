@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 import { loadConfig, type NotifyConfig } from "./config.js";
 import { sendDesktopNotification, sendTmuxWindowAlert } from "./notifier.js";
@@ -35,6 +35,7 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   let config: NotifyConfig = { enable: true };
   let currentCwd = process.cwd();
   let currentSessionId: string | undefined;
+  let currentContext: ExtensionContext | undefined;
   let subagentRpcReady = false;
   let statusSync: { requestId: string; timeout: NodeJS.Timeout; unsubscribe: () => void } | undefined;
   let statusRetry: NodeJS.Timeout | undefined;
@@ -44,7 +45,13 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   const sendNotification = deps.sendNotification ?? sendDesktopNotification;
   const sendTmuxAlert = deps.sendTmuxAlert ?? sendTmuxWindowAlert;
   const runScript = deps.runScript ?? runNotifyScript;
-  const warn = deps.warn ?? ((message: string) => console.warn(message));
+  const warn = (message: string): void => {
+    if (currentContext?.hasUI) {
+      currentContext.ui.notify(message, "warning");
+    } else {
+      (deps.warn ?? console.warn)(message);
+    }
+  };
   const notificationGate = new SubagentNotificationGate((payload) => {
     cancelStatusSync();
     void handleNotify(payload);
@@ -63,6 +70,7 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
 
   pi.on("session_start", async (_event, ctx) => {
     cancelStatusSync();
+    currentContext = ctx;
     currentCwd = ctx.cwd;
     currentSessionId = ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId();
     config = loadConfig(ctx.cwd, deps.home);
@@ -90,6 +98,7 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   pi.on("session_shutdown", () => {
     cancelStatusSync();
     currentSessionId = undefined;
+    currentContext = undefined;
     notificationGate.reset(undefined);
   });
 
