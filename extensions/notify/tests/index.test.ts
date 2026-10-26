@@ -9,7 +9,7 @@ import notify from "../index.js";
 type EventHandler = (event: any, ctx: any) => Promise<void> | void;
 type BusHandler = (payload: any) => void;
 
-function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
+function setup(config?: unknown, env: NodeJS.ProcessEnv = {}, settleDelayMs = 0) {
   const home = mkdtempSync(join(tmpdir(), "pi-notify-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-notify-cwd-"));
   const sessionId = "/tmp/pi-notify-session.json";
@@ -25,6 +25,8 @@ function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
   const scripts: unknown[] = [];
   const warnings: string[] = [];
   let subagentToolAvailable = false;
+  let idle = true;
+  let pendingMessages = false;
 
   const pi = {
     getAllTools() {
@@ -50,6 +52,7 @@ function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
   notify(pi as any, {
     home,
     env,
+    settleDelayMs,
     sendNotification(title, message) {
       sent.push({ title, message });
     },
@@ -73,6 +76,8 @@ function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
     async start() {
       await eventHandlers.session_start({ type: "session_start" }, {
         cwd,
+        isIdle: () => idle,
+        hasPendingMessages: () => pendingMessages,
         sessionManager: {
           getSessionFile: () => sessionId,
           getSessionId: () => "session-1",
@@ -81,6 +86,19 @@ function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
     },
     async agentSettled() {
       await eventHandlers.agent_settled({ type: "agent_settled", messages: [] }, { cwd });
+    },
+    setParentState(state: { idle?: boolean; pendingMessages?: boolean }) {
+      idle = state.idle ?? idle;
+      pendingMessages = state.pendingMessages ?? pendingMessages;
+    },
+    beforeAgentStart() {
+      eventHandlers.before_agent_start({ type: "before_agent_start" }, { cwd });
+    },
+    completionMessageStarted(ids: string[]) {
+      eventHandlers.message_start({
+        type: "message_start",
+        message: { role: "custom", customType: "subagent-notify", details: { runs: ids.map((runId) => ({ runId })) } },
+      }, { cwd });
     },
     agentStarted() {
       eventHandlers.agent_start({ type: "agent_start" }, { cwd });
@@ -105,6 +123,15 @@ function setup(config?: unknown, env: NodeJS.ProcessEnv = {}) {
     },
     async shutdown() {
       await eventHandlers.session_shutdown({ type: "session_shutdown" }, { cwd });
+    },
+    respondWithStatus(getData: () => unknown) {
+      pi.events.on("subagents:rpc:v1:request", (request) => {
+        pi.events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+          requestId: request.requestId,
+          success: true,
+          data: getData(),
+        });
+      });
     },
     respondWithActiveRuns(ids: string[]) {
       pi.events.on("subagents:rpc:v1:request", (request) => {
@@ -136,6 +163,155 @@ test("agent_settled sends fixed default notification", async () => {
   assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
 });
 
+test("background child runtimes never send readiness notifications or script hooks", async () => {
+  for (const env of [{ PI_SUBAGENT_CHILD: "1" }, { PI_SUBAGENT_RUNNER_PID: String(process.pid) }]) {
+    const app = setup({ notify: { script: "./notify.sh" } }, { ...env, TMUX: "tmux" });
+    await app.start();
+    await app.agentSettled();
+    assert.deepEqual(app.sent, []);
+    assert.deepEqual(app.tmuxAlerts, []);
+    assert.deepEqual(app.scripts, []);
+    app.permissionAsk("edit");
+    assert.deepEqual(app.sent, [{ title: "Pi", message: "Permission required: edit" }]);
+    await app.shutdown();
+  }
+});
+
+test("waits for foreground fleet activity even with an empty async snapshot", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const app = setup();
+  let totalActive = 2;
+  app.enableSubagentTool();
+  app.respondWithStatus(() => ({ asyncSnapshot: { runs: [] }, fleet: { totalActive } }));
+  await app.start();
+  await app.agentSettled();
+  assert.deepEqual(app.sent, []);
+  totalActive = 1;
+  t.mock.timers.tick(5000);
+  assert.deepEqual(app.sent, []);
+  totalActive = 0;
+  t.mock.timers.tick(5000);
+  assert.equal(app.sent.length, 1);
+  await app.shutdown();
+});
+
+test("a completed workflow does not hide an active nested child", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const app = setup();
+  let childState = "running";
+  app.enableSubagentTool();
+  app.respondWithStatus(() => ({
+    asyncSnapshot: { runs: [{ id: "workflow", state: "complete", children: [
+      { id: "step", state: "complete", children: [{ id: "nested-child", state: childState }] },
+    ] }] },
+    fleet: { totalActive: 0 },
+  }));
+  await app.start();
+  await app.agentSettled();
+  app.subagentCompleted("workflow");
+  assert.deepEqual(app.sent, []);
+  t.mock.timers.tick(5000);
+  assert.deepEqual(app.sent, []);
+  childState = "complete";
+  t.mock.timers.tick(5000);
+  assert.equal(app.sent.length, 1);
+  await app.shutdown();
+});
+
+test("a late agent_settled handler can resume the parent before notification delivery", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const app = setup(undefined, {}, 100);
+  await app.start();
+  await app.agentSettled();
+  assert.deepEqual(app.sent, []);
+  app.beforeAgentStart();
+  t.mock.timers.tick(100);
+  assert.deepEqual(app.sent, []);
+  app.agentStarted();
+  await app.agentSettled();
+  t.mock.timers.tick(100);
+  assert.equal(app.sent.length, 1);
+  await app.shutdown();
+});
+
+test("delivery checks actual parent idle and message queue state, not just agent events", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const state of [{ idle: false }, { pendingMessages: true }]) {
+    const app = setup(undefined, {}, 100);
+    await app.start();
+    await app.agentSettled();
+    app.setParentState(state);
+    t.mock.timers.tick(100);
+    assert.deepEqual(app.sent, []);
+    app.setParentState({ idle: true, pendingMessages: false });
+    await app.agentSettled();
+    t.mock.timers.tick(100);
+    assert.equal(app.sent.length, 1);
+    await app.shutdown();
+  }
+});
+
+test("an explicitly promised completion wake is not overridden by a grace timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const app = setup();
+  app.enableSubagentTool();
+  const active = ["child"];
+  app.respondWithActiveRuns(active);
+  await app.start();
+  await app.agentSettled();
+  active.length = 0;
+  app.subagentCompleted("child", undefined, true);
+  // A batched wake may not even be in Pi's message queue yet.
+  t.mock.timers.tick(15000);
+  assert.deepEqual(app.sent, []);
+  app.beforeAgentStart();
+  app.agentStarted();
+  await app.agentSettled();
+  assert.equal(app.sent.length, 1);
+  await app.shutdown();
+});
+
+test("a busy parent is not assumed to have consumed a delayed completion batch", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const app = setup();
+  app.enableSubagentTool();
+  const active = ["child"];
+  app.respondWithActiveRuns(active);
+  await app.start();
+  app.agentStarted();
+  app.subagentStarted("child");
+  active.length = 0;
+  app.subagentCompleted("child", undefined, true);
+  await app.agentSettled();
+  t.mock.timers.tick(10000);
+  assert.deepEqual(app.sent, []);
+  app.agentStarted();
+  app.completionMessageStarted(["child"]);
+  await app.agentSettled();
+  assert.equal(app.sent.length, 1);
+  await app.shutdown();
+});
+
+test("a queued completion wake still blocks readiness after the grace period", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const app = setup();
+  app.enableSubagentTool();
+  const active = ["child"];
+  app.respondWithActiveRuns(active);
+  await app.start();
+  await app.agentSettled();
+  active.length = 0;
+  app.setParentState({ pendingMessages: true });
+  app.subagentCompleted("child", undefined, true);
+  t.mock.timers.tick(2000);
+  assert.deepEqual(app.sent, []);
+  app.agentStarted();
+  app.setParentState({ pendingMessages: false });
+  await app.agentSettled();
+  assert.equal(app.sent.length, 1);
+  await app.shutdown();
+});
+
 test("permissions:ask sends fixed default notification with tool name", async () => {
   const app = setup();
   await app.start();
@@ -163,13 +339,15 @@ test("agent_settled waits until all active async subagents have completed", asyn
 
 test("restores active subagents from pi-subagents status after session start", async () => {
   const app = setup();
-  app.respondWithActiveRuns(["restored-run"]);
+  const active = ["restored-run"];
+  app.respondWithActiveRuns(active);
   await app.start();
   app.subagentRpcReady();
 
   await app.agentSettled();
   assert.deepEqual(app.sent, []);
 
+  active.length = 0;
   app.subagentCompleted("restored-run");
   assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
 });
@@ -194,12 +372,14 @@ test("rechecks status at settle for runs whose start event was missed", async ()
 test("detects pi-subagents even when its RPC ready event was missed", async () => {
   const app = setup();
   app.enableSubagentTool();
-  app.respondWithActiveRuns(["already-running"]);
+  const active = ["already-running"];
+  app.respondWithActiveRuns(active);
   await app.start();
 
   await app.agentSettled();
   assert.deepEqual(app.sent, []);
 
+  active.length = 0;
   app.subagentCompleted("already-running");
   assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
   await app.shutdown();
@@ -241,6 +421,8 @@ test("holds notifications during an asynchronous status check and replays new st
   assert.deepEqual(app.sent, []);
 
   app.subagentCompleted("started-during-check");
+  assert.deepEqual(app.sent, []);
+  reply!([]);
   assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
   await app.shutdown();
 });
@@ -261,6 +443,8 @@ test("settling replaces an older in-flight status query rather than trusting its
   assert.deepEqual(app.sent, []);
 
   app.subagentCompleted("launched-after-startup-query");
+  assert.deepEqual(app.sent, []);
+  replies[2]([]);
   assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
   await app.shutdown();
 });
@@ -458,6 +642,7 @@ for (const hasUI of [false, true]) {
     notify(pi as any, {
       home,
       env: {},
+      settleDelayMs: 0,
       sendNotification(title, message) {
         sent.push({ title, message });
       },

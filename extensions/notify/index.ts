@@ -5,7 +5,7 @@ import { loadConfig, type NotifyConfig } from "./config.js";
 import { sendDesktopNotification, sendTmuxWindowAlert } from "./notifier.js";
 import { runNotifyScript, type NotifyPayload, type TerminalContext } from "./script.js";
 import {
-  activeSubagentIdsFromRpcReply,
+  subagentActivityFromRpcReply,
   SUBAGENT_ASYNC_COMPLETE_EVENT,
   SUBAGENT_ASYNC_STARTED_EVENT,
   SUBAGENT_RPC_READY_EVENT,
@@ -26,6 +26,7 @@ type NotifyDeps = {
   sendTmuxAlert?: () => void;
   runScript?: (script: string, payload: NotifyPayload) => void | Promise<void>;
   warn?: (message: string) => void;
+  settleDelayMs?: number;
 };
 
 const TITLE = "Pi" as const;
@@ -42,6 +43,7 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   let statusSyncWarningLogged = false;
 
   const env = deps.env ?? process.env;
+  const isSubagentChild = env.PI_SUBAGENT_CHILD === "1" || env.PI_SUBAGENT_RUNNER_PID === String(process.pid);
   const sendNotification = deps.sendNotification ?? sendDesktopNotification;
   const sendTmuxAlert = deps.sendTmuxAlert ?? sendTmuxWindowAlert;
   const runScript = deps.runScript ?? runNotifyScript;
@@ -52,16 +54,27 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
       (deps.warn ?? console.warn)(message);
     }
   };
-  const notificationGate = new SubagentNotificationGate((payload) => {
-    cancelStatusSync();
-    void handleNotify(payload);
-  });
+  const notificationGate = new SubagentNotificationGate(
+    (payload) => {
+      cancelStatusSync();
+      void handleNotify(payload);
+    },
+    1000,
+    () => Boolean(currentSessionId) &&
+      currentContext?.isIdle?.() !== false && currentContext?.hasPendingMessages?.() !== true,
+    deps.settleDelayMs ?? 1000,
+  );
 
   pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, (data: unknown) => {
     notificationGate.trackStarted(data);
   });
   pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, (data: unknown) => {
+    const recheck = notificationGate.hasPendingNotification && isCurrentSessionEvent(data) && hasSubagentRpc();
+    // A root completing does not prove that its descendants or foreground
+    // siblings finished. Hold delivery while checking the whole fleet again.
+    if (recheck) notificationGate.beginStatusSync();
     notificationGate.trackCompleted(data);
+    if (recheck) syncActiveSubagents();
   });
   pi.events.on(SUBAGENT_RPC_READY_EVENT, () => {
     subagentRpcReady = true;
@@ -79,6 +92,10 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
     if (subagentRpcReady) syncActiveSubagents();
   });
 
+  pi.on("before_agent_start", () => {
+    notificationGate.parentAgentStarted();
+  });
+
   pi.on("agent_start", () => {
     notificationGate.parentAgentStarted();
   });
@@ -87,11 +104,24 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
     notificationGate.parentAgentStopped();
   });
 
-  pi.on("agent_settled", async () => {
+  pi.on("message_start", (event) => {
+    const message = event.message;
+    if (message.role !== "custom" || message.customType !== "subagent-notify") return;
+    const details = message.details as { runs?: Array<{ runId?: unknown }> } | undefined;
+    const runIds = Array.isArray(details?.runs)
+      ? details.runs.flatMap((run) => typeof run?.runId === "string" ? [run.runId] : [])
+      : [];
+    notificationGate.parentCompletionMessageStarted(runIds);
+  });
+
+  pi.on("agent_settled", async (event) => {
+    // Background runners load ambient extensions too, but a child finishing
+    // must not announce readiness on behalf of its still-working parent.
+    if (isSubagentChild) return;
     // Lifecycle events can be missed (for example across reloads). Check the
     // current fleet before allowing an idle parent to announce readiness.
     syncActiveSubagents();
-    notificationGate.settle(createPayload("agent_settled", AGENT_SETTLED_MESSAGE));
+    notificationGate.settle(createPayload("agent_settled", AGENT_SETTLED_MESSAGE), event.aborted === true);
     if (notificationGate.hasPendingNotification && subagentRpcReady && !statusSync) scheduleStatusSyncRetry();
   });
 
@@ -128,10 +158,18 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
     }, 5000);
   }
 
-  function syncActiveSubagents(): void {
+  function isCurrentSessionEvent(data: unknown): boolean {
+    return typeof data === "object" && data !== null && "sessionId" in data && data.sessionId === currentSessionId;
+  }
+
+  function hasSubagentRpc(): boolean {
     // The ready event is not replayed if this extension subscribes after it.
     subagentRpcReady ||= pi.getAllTools?.().some((tool) => tool.name === "subagent") ?? false;
-    if (!currentSessionId || !subagentRpcReady) return;
+    return subagentRpcReady;
+  }
+
+  function syncActiveSubagents(): void {
+    if (isSubagentChild || !currentSessionId || !hasSubagentRpc()) return;
     // A lookup started earlier in the turn may predate its background launches.
     cancelStatusSync();
 
@@ -144,8 +182,8 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
       clearTimeout(statusSync.timeout);
       statusSync.unsubscribe();
       statusSync = undefined;
-      const activeRunIds = reply === undefined ? undefined : activeSubagentIdsFromRpcReply(reply);
-      if (activeRunIds === undefined) {
+      const activity = reply === undefined ? undefined : subagentActivityFromRpcReply(reply);
+      if (activity === undefined) {
         if (!statusSyncWarningLogged) {
           warn("notify: could not reconcile active pi-subagents status; retrying before sending settled notifications");
           statusSyncWarningLogged = true;
@@ -154,7 +192,7 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
         return;
       }
       statusSyncWarningLogged = false;
-      notificationGate.reconcileStatus(activeRunIds);
+      notificationGate.reconcileStatus(activity.activeRunIds, activity.hasAdditionalActivity);
       // Keep held notifications live even if a completion event is also lost.
       if (notificationGate.hasPendingNotification) scheduleStatusSyncRetry();
     };
