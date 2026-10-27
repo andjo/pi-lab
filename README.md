@@ -12,6 +12,8 @@ After install, restart `pi` (or run `/reload`) and the extensions in this repo w
 
 ## Extensions
 
+- `media-keys`: prevents Kitty-protocol play/pause, next/previous track, and volume up/down events from appearing as characters in the editor (notably in VS Code's terminal). Filters press/repeat/release events inside Pi without intercepting OS media controls. Remove any temporary VS Code media-key bindings or standalone `filter-media-keys.ts` workaround, then run `/reload`.
+
 - `subscription-fallback` (`/subswitch`): multi-vendor (OpenAI/Claude) route failover manager with preference stack, guided setup (+ validate-now checks), OAuth/API routes, persisted cooldown/holdoff/event state, context-window-aware switching/compaction, `/subswitch explain` + `/subswitch events`, continuation fallback, and background return-to-preferred probing.
 - `title-status`: shows a small status icon (busy/ready/pending) in the terminal title.
 - `live-commentary`: summarizes long-running bash tool output with a small widget (auto-starts after ~10s).

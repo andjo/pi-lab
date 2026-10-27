@@ -6,6 +6,7 @@
   "keywords": ["pi-package"],
   "type": "module",
   "scripts": {
+    "test:media-keys": "node --experimental-strip-types --test extensions/media-keys/tests/index.test.ts",
     "test:subswitch": "node --test extensions/subscription-fallback/tests/subswitch_regression.test.mjs"
   },
   "pi": {
