@@ -73,9 +73,10 @@ function setup(config?: unknown, env: NodeJS.ProcessEnv = {}, settleDelayMs = 0)
     tmuxAlerts,
     scripts,
     warnings,
-    async start() {
+    async start(mode = "tui") {
       await eventHandlers.session_start({ type: "session_start" }, {
         cwd,
+        mode,
         isIdle: () => idle,
         hasPendingMessages: () => pendingMessages,
         sessionManager: {
@@ -163,8 +164,12 @@ test("agent_settled sends fixed default notification", async () => {
   assert.deepEqual(app.sent, [{ title: "Pi", message: "Ready for input" }]);
 });
 
-test("background child runtimes never send readiness notifications or script hooks", async () => {
-  for (const env of [{ PI_SUBAGENT_CHILD: "1" }, { PI_SUBAGENT_RUNNER_PID: String(process.pid) }]) {
+test("marked child runtimes never send desktop, tmux, or script notifications", async () => {
+  for (const env of [
+    { PI_SUBAGENT_CHILD: "1" },
+    { PI_SUBAGENT_RUNNER_PID: String(process.pid) },
+    { PI_SUBAGENTS_HERDR_BRIDGE: "1" },
+  ]) {
     const app = setup({ notify: { script: "./notify.sh" } }, { ...env, TMUX: "tmux" });
     await app.start();
     await app.agentSettled();
@@ -172,9 +177,57 @@ test("background child runtimes never send readiness notifications or script hoo
     assert.deepEqual(app.tmuxAlerts, []);
     assert.deepEqual(app.scripts, []);
     app.permissionAsk("edit");
-    assert.deepEqual(app.sent, [{ title: "Pi", message: "Permission required: edit" }]);
+    assert.deepEqual(app.sent, []);
+    assert.deepEqual(app.tmuxAlerts, []);
+    assert.deepEqual(app.scripts, []);
     await app.shutdown();
   }
+});
+
+test("foreground children and headless sessions cannot notify without child env markers", async () => {
+  for (const mode of ["print", "json", "unknown"]) {
+    const app = setup({ notify: { script: "./notify.sh" } }, { TMUX: "tmux" });
+    await app.start(mode);
+    await app.agentSettled();
+    app.permissionAsk("edit");
+    assert.deepEqual(app.sent, [], mode);
+    assert.deepEqual(app.tmuxAlerts, [], mode);
+    assert.deepEqual(app.scripts, [], mode);
+    await app.shutdown();
+  }
+});
+
+test("only an active parent TUI or RPC session owns notifications", async () => {
+  for (const mode of ["tui", "rpc"]) {
+    const app = setup({ notify: { script: "./notify.sh" } }, { TMUX: "tmux" });
+    app.permissionAsk("before-session");
+    assert.deepEqual(app.sent, []);
+    await app.start(mode);
+    await app.agentSettled();
+    app.permissionAsk("edit");
+    assert.equal(app.sent.length, 2);
+    assert.equal(app.tmuxAlerts.length, 2);
+    assert.equal(app.scripts.length, 2);
+    await app.shutdown();
+    app.permissionAsk("after-shutdown");
+    assert.equal(app.sent.length, 2);
+    assert.equal(app.tmuxAlerts.length, 2);
+    assert.equal(app.scripts.length, 2);
+  }
+});
+
+test("switching from a parent session to a child cancels pending delivery", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const app = setup({ notify: { script: "./notify.sh" } }, { TMUX: "tmux" }, 100);
+  await app.start("tui");
+  await app.agentSettled();
+  await app.start("print");
+  app.permissionAsk("edit");
+  t.mock.timers.tick(10000);
+  assert.deepEqual(app.sent, []);
+  assert.deepEqual(app.tmuxAlerts, []);
+  assert.deepEqual(app.scripts, []);
+  await app.shutdown();
 });
 
 test("waits for foreground fleet activity even with an empty async snapshot", async (t) => {
@@ -655,6 +708,7 @@ for (const hasUI of [false, true]) {
     });
     await eventHandlers.session_start({ type: "session_start" }, {
       cwd,
+      mode: "tui",
       hasUI,
       ui: {
         notify(message: string, type: string) {

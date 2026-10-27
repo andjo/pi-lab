@@ -37,13 +37,15 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   let currentCwd = process.cwd();
   let currentSessionId: string | undefined;
   let currentContext: ExtensionContext | undefined;
+  let isNotificationHost = false;
   let subagentRpcReady = false;
   let statusSync: { requestId: string; timeout: NodeJS.Timeout; unsubscribe: () => void } | undefined;
   let statusRetry: NodeJS.Timeout | undefined;
   let statusSyncWarningLogged = false;
 
   const env = deps.env ?? process.env;
-  const isSubagentChild = env.PI_SUBAGENT_CHILD === "1" || env.PI_SUBAGENT_RUNNER_PID === String(process.pid);
+  const isSubagentChild = env.PI_SUBAGENT_CHILD === "1" ||
+    env.PI_SUBAGENT_RUNNER_PID === String(process.pid) || env.PI_SUBAGENTS_HERDR_BRIDGE === "1";
   const sendNotification = deps.sendNotification ?? sendDesktopNotification;
   const sendTmuxAlert = deps.sendTmuxAlert ?? sendTmuxWindowAlert;
   const runScript = deps.runScript ?? runNotifyScript;
@@ -60,7 +62,7 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
       void handleNotify(payload);
     },
     1000,
-    () => Boolean(currentSessionId) &&
+    () => isNotificationHost && Boolean(currentSessionId) &&
       currentContext?.isIdle?.() !== false && currentContext?.hasPendingMessages?.() !== true,
     deps.settleDelayMs ?? 1000,
   );
@@ -84,6 +86,9 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   pi.on("session_start", async (_event, ctx) => {
     cancelStatusSync();
     currentContext = ctx;
+    // Foreground children share the parent's process (and environment), but
+    // bind extensions in print mode. Only the parent UI session owns alerts.
+    isNotificationHost = !isSubagentChild && (ctx.mode === "tui" || ctx.mode === "rpc");
     currentCwd = ctx.cwd;
     currentSessionId = ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId();
     config = loadConfig(ctx.cwd, deps.home);
@@ -115,9 +120,7 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   });
 
   pi.on("agent_settled", async (event) => {
-    // Background runners load ambient extensions too, but a child finishing
-    // must not announce readiness on behalf of its still-working parent.
-    if (isSubagentChild) return;
+    if (!isNotificationHost) return;
     // Lifecycle events can be missed (for example across reloads). Check the
     // current fleet before allowing an idle parent to announce readiness.
     syncActiveSubagents();
@@ -129,6 +132,7 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
     cancelStatusSync();
     currentSessionId = undefined;
     currentContext = undefined;
+    isNotificationHost = false;
     notificationGate.reset(undefined);
   });
 
@@ -169,7 +173,7 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   }
 
   function syncActiveSubagents(): void {
-    if (isSubagentChild || !currentSessionId || !hasSubagentRpc()) return;
+    if (!isNotificationHost || !currentSessionId || !hasSubagentRpc()) return;
     // A lookup started earlier in the turn may predate its background launches.
     cancelStatusSync();
 
@@ -226,7 +230,9 @@ export default function (pi: ExtensionAPI, deps: NotifyDeps = {}) {
   }
 
   async function handleNotify(payload: NotifyPayload): Promise<void> {
-    if (env.PI_INSIDE_FROSTPI === "1") return;
+    // Centralized ownership check covers readiness, permission prompts and
+    // script hooks alike, including events outside an active parent session.
+    if (!isNotificationHost || env.PI_INSIDE_FROSTPI === "1") return;
 
     if (config.enable) {
       sendNotification(payload.title, payload.message);

@@ -23,11 +23,13 @@ This extension sends a notification for two events:
 
 The notification extension tracks `pi-subagents` lifecycle events and reconciles activity from its status RPC when a session starts or reloads, whenever the parent settles, and when a completion could release a held notification. While a notification is held, status is checked every five seconds to recover from missed lifecycle events. Failed or malformed status checks keep the notification held until a successful retry.
 
-Readiness delivery has a one-second quiet period, followed by a final check that the parent is idle with no queued messages. Parent startup (including `before_agent_start`) and new child activity cancel pending delivery. Background child runtimes (`PI_SUBAGENT_CHILD=1` or the matching `PI_SUBAGENT_RUNNER_PID`) never send readiness notifications themselves, even when they load this extension through ambient settings. Permission notifications remain immediate.
+Readiness delivery has a one-second quiet period, followed by a final check that the parent is idle with no queued messages. Parent startup (including `before_agent_start`) and new child activity cancel pending delivery.
+
+Only an active parent TUI or RPC session may send notifications. Print/JSON sessions (including same-process foreground children), background child runtimes (`PI_SUBAGENT_CHILD=1` or the matching `PI_SUBAGENT_RUNNER_PID`), and Herdr child bridges (`PI_SUBAGENTS_HERDR_BRIDGE=1`) send no desktop alerts, tmux bells, or script hooks. This applies to permission events as well as readiness events, and prevents ambient copies of this extension in children from notifying independently. Standalone headless print/JSON invocations are also silent.
 
 Without `pi-subagents`, readiness notifications still use the quiet period and final parent-state check.
 
-`permissions:ask` is emitted by [`@pi-lab/permissions`](https://www.npmjs.com/package/@pi-lab/permissions) immediately before a permission prompt is shown. Permission notifications are sent immediately and are not held for background runs.
+`permissions:ask` is emitted by [`@pi-lab/permissions`](https://www.npmjs.com/package/@pi-lab/permissions) immediately before a permission prompt is shown. Permission notifications in the parent TUI/RPC session are sent immediately and are not held for background runs. Child sessions never notify independently.
 
 When `PI_INSIDE_FROSTPI=1`, this extension suppresses all notifications, including built-in desktop notifications, tmux alerts, and configured script hooks.
 
@@ -79,7 +81,7 @@ Local config overrides global config.
 }
 ```
 
-When configured, the script is executed for every notify event in addition to the built-in notification. The script receives a JSON payload on stdin and has a fixed 5 second timeout. Failures appear as Pi UI warnings (or console warnings in non-interactive sessions) and do not affect agent execution or permission prompts.
+When configured, the script is executed for every eligible parent-session notify event in addition to the built-in notification. The script receives a JSON payload on stdin and has a fixed 5 second timeout. Failures appear as Pi UI warnings (or console warnings when the parent UI is unavailable) and do not affect agent execution or permission prompts.
 
 Example payload for `agent_settled`:
 
