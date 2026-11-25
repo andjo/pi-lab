@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 
 // Match code spans and fenced blocks first so examples stay as written.
 const CITATION = /(?:^ {0,3}(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^ {0,3}\1[ \t]*$|(?![\s\S])))|(?:(`+)[^\n]*?\2)|\[([^\[\]\n]+)\]\(vscode-local:([^\s()]*)\)/gm;
-const AUTHORITY = /^Authority:[ \t]*`([\w.+%-]+)`[ \t]*$/m;
+const AUTHORITY = /^[\w.+%-]+$/;
 
 export function expandVscodeLinks(markdown: string, authority: string, cwd: string): string {
   return markdown.replace(CITATION, (match, _fence, _code, label, destination) => {
@@ -37,13 +37,15 @@ export default function vscodeLocalLinks(pi: ExtensionAPI): void {
       typeof pi.registerMarkdownTransformer !== "function") {
     return;
   }
-  let authority: string | undefined;
+  let authority: unknown;
   try {
-    authority = AUTHORITY.exec(readFileSync(join(homedir(), ".pi/agent/AGENTS.md"), "utf8"))?.[1];
+    const configPath = join(homedir(), ".pi", "agent", "pi-lab", "vscode-local-links.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    authority = config?.authority;
   } catch {
     return;
   }
-  if (!authority) {
+  if (typeof authority !== "string" || !AUTHORITY.test(authority)) {
     return;
   }
   const remote = authority;
@@ -57,7 +59,7 @@ export default function vscodeLocalLinks(pi: ExtensionAPI): void {
       event.systemPromptOptions.sections.vscode_local_links =
         "For VS Code file citations in this Herdr session, write `[path:line](vscode-local:)` " +
         "with a path relative to the session directory or an absolute container path. " +
-        "Pi expands the link for display; use this instead of running vscode-link or emitting a full remote URL.";
+        "Pi expands the link to the full remote URL when rendering.";
     }
   });
 }
